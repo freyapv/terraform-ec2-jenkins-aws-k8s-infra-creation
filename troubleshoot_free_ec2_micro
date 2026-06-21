@@ -1,0 +1,162 @@
+# Jenkins + SonarCloud Pipeline — Troubleshooting Reference
+
+Setup: Jenkins on a single EC2 box (Amazon Linux, ~1 GB RAM), declarative pipeline
+running `mvn clean verify sonar:sonar` against SonarCloud for the `easybuggy` app.
+
+Symptom that started it all: build stuck at **"Waiting for next available executor."**
+Root cause was NOT slowness — the build was never running.
+
+---
+
+## 1. Build never scheduled — node was benched
+
+The controller's built-in node was taken offline by node monitors, so no executor
+was ever granted. Two monitor thresholds were tripping.
+
+### a) No swap (Free Swap Space = 0 B)
+
+~1 GB box with zero swap. Added a 2 GB swapfile:
+
+```bash
+sudo dd if=/dev/zero of=/swapfile bs=128M count=16
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+free -h                                              # confirm Swap: 2.0Gi
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab   # persist across reboot
+```
+
+### b) Free Temp Space below threshold (the real blocker)
+
+`/tmp` was a 459 MB tmpfs — can never satisfy Jenkins' 1 GiB temp-space threshold,
+so the node stayed offline permanently. Fix: point the JVM's temp dir at the root
+volume (4+ GiB free) instead of the tiny tmpfs.
+
+```bash
+# create a temp dir on the real disk
+sudo mkdir -p /var/lib/jenkins/tmp
+sudo chown jenkins:jenkins /var/lib/jenkins/tmp
+sudo chmod 700 /var/lib/jenkins/tmp
+```
+
+The RPM launches Jenkins via the `/usr/bin/jenkins` wrapper, which passes `JAVA_OPTS`
+to java. Set it via a systemd drop-in override (written directly to avoid editor issues):
+
+```bash
+sudo mkdir -p /etc/systemd/system/jenkins.service.d
+sudo tee /etc/systemd/system/jenkins.service.d/override.conf > /dev/null <<'EOF'
+[Service]
+Environment="JAVA_OPTS=-Djava.io.tmpdir=/var/lib/jenkins/tmp"
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl restart jenkins
+sleep 45
+ps aux | grep '[j]ava' | grep -o 'java.io.tmpdir=[^ ]*'   # must print /var/lib/jenkins/tmp
+```
+
+Result: node came back online and stayed online. Build scheduled and ran.
+
+### Useful diagnostics used along the way
+
+```bash
+df -h /                                              # disk usage (was fine at 48%)
+free -h                                              # RAM + swap
+sudo systemctl status jenkins --no-pager | head -8   # is Jenkins healthy
+sudo journalctl -u jenkins --no-pager | tail -30     # check for OOM / errors
+grep -i executor /var/lib/jenkins/config.xml         # numExecutors (was 2, fine)
+cat /var/lib/jenkins/queue.xml                        # queued items + reasons
+sudo cat /usr/bin/jenkins                             # confirm which var the wrapper reads
+sudo systemctl cat jenkins                            # see ExecStart
+# watch builds appear:
+watch -n2 'sudo ls /var/lib/jenkins/jobs/ASGBuggyDevSecOpsPipeline/builds/'
+# tail a build log live:
+sudo tail -f /var/lib/jenkins/jobs/ASGBuggyDevSecOpsPipeline/builds/<n>/log
+```
+
+Quick-unblock alternative (if you'd rather not restart Jenkins) — lower the temp
+threshold via Manage Jenkins -> Script Console:
+
+```groovy
+import hudson.node_monitors.*
+hudson.node_monitors.TemporarySpaceMonitor.DESCRIPTOR.setFreeSpaceThreshold("256MiB")
+println "threshold lowered"
+```
+
+---
+
+## 2. SonarCloud: "Organization key 'Matr33shka' does not exist"
+
+Used the org **display name** instead of the org **key**. The key is the lowercase
+slug in the SonarCloud URL: `https://sonarcloud.io/organizations/<KEY>/`.
+
+Fix in the Jenkinsfile mvn command:
+
+```
+-Dsonar.organization=<correct-lowercase-org-key>
+```
+
+---
+
+## 3. Sonar analysis OOM — "Java heap space"
+
+Build compiled, packaged, and ran full Java analysis, then died when Sonar spawned
+the Node runtime for JS/TS/CSS analysis. The ~1 GB box ran out of heap.
+
+### Fix A — skip the JS analyzer (this is a Java/JSP app) and cap scanner heap
+
+Add to the mvn command:
+
+```
+-Dsonar.exclusions=**/*.js,**/*.ts,**/*.css,**/*.html -Dsonar.scanner.javaOpts=-Xmx256m
+```
+
+### Fix B — cap Maven's own heap (pipeline environment block)
+
+```groovy
+environment {
+    MAVEN_OPTS = "-Xmx512m"
+}
+```
+
+### Fix C — real fix: more RAM
+
+Resize the instance to `t3.small` (2 GB) or `t3.medium` (4 GB). SonarCloud's
+multi-language analyzers want >= 2 GB. EC2 console -> stop instance -> change
+instance type -> start (same disk, same setup).
+
+---
+
+## Recommended final mvn command
+
+```groovy
+sh "mvn clean verify sonar:sonar \
+  -Dsonar.projectKey=freyapvasbuggywebapp \
+  -Dsonar.organization=<correct-org-key> \
+  -Dsonar.host.url=https://sonarcloud.io \
+  -Dsonar.token=$SONAR_TOKEN \
+  -Dsonar.exclusions=**/*.js,**/*.ts,**/*.css,**/*.html \
+  -Dsonar.scanner.javaOpts=-Xmx256m"
+```
+
+---
+
+## Follow-ups (not blocking, but do them)
+
+- **Rotate + stop hardcoding the SonarCloud token.** It landed in every build log.
+  Store it as a Jenkins credential and reference it:
+  ```groovy
+  environment { SONAR_TOKEN = credentials('sonarcloud-token') }
+  ```
+  Then use `-Dsonar.token=$SONAR_TOKEN` (as above).
+- **Speed:** first run was slow only due to cold `.m2` dependency download (one-time).
+  Drop `clean` while iterating; optionally split Sonar into its own stage so you
+  don't rebuild on every analysis tweak.
+
+---
+
+## One-line summary of root causes
+
+1. Node offline — 459 MB tmpfs couldn't meet the 1 GiB temp threshold + no swap.
+2. Wrong SonarCloud value — used org *name* instead of org *key*.
+3. OOM — 1 GB box too small for Sonar's multi-language (Node) analysis.
